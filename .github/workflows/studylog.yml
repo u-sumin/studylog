@@ -1,0 +1,42 @@
+name: Studylog schedule
+
+on:
+  schedule:
+    - cron: '0 9 * * 0'
+      timezone: 'Asia/Seoul'
+    - cron: '20 7 * * 1-6'
+      timezone: 'Asia/Seoul'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: studylog-band-job
+  cancel-in-progress: false
+
+jobs:
+  studylog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Print offline preview
+        run: python band_bot.py --mode preview
+
+      - name: Execute schedule if approved and enabled
+        env:
+          BAND_LIVE_ENABLED: ${{ vars.BAND_LIVE_ENABLED }}
+          BAND_ACCESS_TOKEN: ${{ secrets.BAND_ACCESS_TOKEN }}
+          BAND_KEY: ${{ secrets.BAND_KEY }}
+        run: python band_bot.py --mode auto
