@@ -1,256 +1,208 @@
 #!/usr/bin/env python3
-"""Studylog: BAND Open API posting and one-comment daily leave summary.
-
-No network access is made in preview mode. Live actions are explicitly gated
-by BAND_LIVE_ENABLED=true, and should only be enabled after BAND API approval.
-"""
+"""Studylog: write-only weekly BAND posts. No member, post or comment reads."""
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
-import re
 import sys
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
 WEEKDAYS = ("월", "화", "수", "목", "금", "토", "일")
-CATEGORIES = ("반휴", "월휴", "시험휴")
-BASE = "https://openapi.band.us"
-MAX_PAGES = 30
+BAND_URL = "https://openapi.band.us"
+GITHUB_URL = "https://api.github.com"
 
 
 class StudylogError(Exception):
-    """Safe-to-display operational error without credentials."""
+    pass
 
 
 def sunday_for(day: dt.date) -> dt.date:
     return day - dt.timedelta(days=(day.weekday() + 1) % 7)
 
 
-def weekly_dates(sunday: dt.date) -> list[dt.date]:
+def weekly_posts(sunday: dt.date) -> list[str]:
     if sunday.weekday() != 6:
-        raise ValueError("The input date must be Sunday.")
-    return [sunday + dt.timedelta(days=i) for i in range(1, 7)]
+        raise ValueError("Expected Sunday.")
+    return [
+        f"{sunday + dt.timedelta(days=i):%y/%m/%d} {WEEKDAYS[(sunday + dt.timedelta(days=i)).weekday()]}"
+        for i in range(1, 7)
+    ]
 
 
-def post_text(day: dt.date) -> str:
-    return f"{day:%y/%m/%d} {WEEKDAYS[day.weekday()]}"
+def scheduled_now(now: dt.datetime) -> bool:
+    local = now.astimezone(KST)
+    return local.weekday() == 6 and local.time() >= dt.time(9, 0)
 
 
-def cutoff_for(day: dt.date) -> dt.datetime:
-    return dt.datetime.combine(day, dt.time(7, 20), tzinfo=KST)
+def request_json(request: Request, service: str) -> dict:
+    try:
+        with urlopen(request, timeout=20) as response:
+            value = json.load(response)
+    except HTTPError as err:
+        raise StudylogError(f"{service} HTTP {err.code}.") from None
+    except (URLError, TimeoutError, OSError):
+        raise StudylogError(f"{service} connection failed.") from None
+    except (ValueError, TypeError):
+        raise StudylogError(f"{service} returned invalid JSON.") from None
+    if not isinstance(value, dict):
+        raise StudylogError(f"{service} returned invalid data.")
+    return value
 
 
-def from_band_time(value: int | str) -> dt.datetime:
-    # BAND documents created_at as epoch milliseconds.
-    number = int(value)
-    return dt.datetime.fromtimestamp(number / 1000, tz=dt.timezone.utc).astimezone(KST)
+class BandWriter:
+    """Only checks write permission and creates posts on one specified band."""
 
-
-def comment_body(comment: dict) -> str:
-    return str(comment.get("content") or comment.get("body") or "").strip()
-
-
-def is_summary(body: str) -> bool:
-    lines = body.strip().splitlines()
-    if len(lines) != 3:
-        return False
-    return all(re.match(r"^\s*" + re.escape(cat) + r"\s*:", line) for cat, line in zip(CATEGORIES, lines))
-
-
-def aggregate(comments: list[dict], day: dt.date) -> str:
-    deadline = cutoff_for(day)
-    names = {key: [] for key in CATEGORIES}
-    seen = {key: set() for key in CATEGORIES}
-    # Sort for stable output regardless of API ordering/pagination.
-    ordered = sorted(comments, key=lambda x: int(x.get("created_at", 0)))
-    for comment in ordered:
-        category = comment_body(comment)
-        if category not in names:
-            continue
-        if "created_at" not in comment:
-            # Missing timestamps must not silently be treated as on time.
-            raise StudylogError("A leave comment is missing its creation timestamp.")
-        if from_band_time(comment["created_at"]) > deadline:
-            continue
-        author = comment.get("author") or {}
-        name = str(author.get("name") or "").strip()
-        if not name:
-            raise StudylogError("A leave comment is missing its author name.")
-        # The stable BAND user key is preferred; name is the fallback.
-        identity = str(author.get("user_key") or name)
-        if identity not in seen[category]:
-            seen[category].add(identity)
-            names[category].append(name)
-    return "\n".join(f"{cat}: {', '.join(names[cat]) if names[cat] else '-'}" for cat in CATEGORIES)
-
-
-def matching_post(posts: list[dict], day: dt.date) -> dict | None:
-    """Find an exact date-title post created within the target calendar week.
-
-    Ambiguous matches are unsafe: do not write to either post.
-    """
-    week_start = sunday_for(day)
-    matches = []
-    for post in posts:
-        if str(post.get("content") or "").strip() != post_text(day):
-            continue
-        if not post.get("post_key"):
-            continue
-        if "created_at" not in post:
-            raise StudylogError("A matching post has no timestamp; cannot verify its week.")
-        creation_day = from_band_time(post["created_at"]).date()
-        if week_start <= creation_day <= week_start + dt.timedelta(days=6):
-            matches.append(post)
-    if len(matches) > 1:
-        raise StudylogError(f"Multiple matching posts exist for {post_text(day)}; skipped for safety.")
-    return matches[0] if matches else None
-
-
-class BandAPI:
-    def __init__(self, token: str, band_key: str):
-        self.token = token
+    def __init__(self, access_token: str, band_key: str):
+        self.access_token = access_token
         self.band_key = band_key
 
-    def request(self, method: str, path: str, params: dict) -> dict:
-        data = {**params, "band_key": self.band_key, "access_token": self.token}
-        body = urlencode(data).encode("utf-8")
-        if method == "GET":
-            req = Request(BASE + path + "?" + body.decode("ascii"), method="GET")
+    def call(self, method: str, path: str, fields: dict) -> dict:
+        parameters = {
+            "access_token": self.access_token,
+            "band_key": self.band_key,
+            **fields,
+        }
+        encoded = urlencode(parameters).encode("utf-8")
+        if method == "POST":
+            request = Request(BAND_URL + path, data=encoded, method="POST")
         else:
-            req = Request(BASE + path, data=body, method="POST")
+            request = Request(BAND_URL + path + "?" + encoded.decode("ascii"), method="GET")
+        response = request_json(request, "BAND API")
+        if response.get("result_code") != 1:
+            raise StudylogError("BAND API returned a non-success result.")
+        return response.get("result_data") or {}
+
+    def require_posting_permission(self) -> None:
+        data = self.call("GET", "/v2/band/permissions", {"permissions": "posting"})
+        allowed = data.get("permissions", data.get("permission", []))
+        if "posting" not in (allowed or []):
+            raise StudylogError("Posting permission has not been granted for this band.")
+
+    def create_post(self, text: str) -> None:
+        data = self.call(
+            "POST", "/v2.2/band/post/create", {"content": text, "do_push": "false"}
+        )
+        if not data.get("post_key"):
+            raise StudylogError("BAND response has no post_key; manual confirmation required.")
+
+
+class GitHubLedger:
+    """Date/status flags only. Never stores member data or BAND credentials."""
+
+    def __init__(self, token: str, repo: str, branch: str = "main"):
+        if repo.count("/") != 1:
+            raise StudylogError("Invalid GITHUB_REPOSITORY.")
+        self.url_prefix = f"{GITHUB_URL}/repos/{repo}/contents/.studylog-state"
+        self.branch = branch
+        self.headers = {
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        self.sha: str | None = None
+
+    def load(self, sunday: dt.date) -> dict[str, str]:
+        url = f"{self.url_prefix}/{sunday.isoformat()}.json"
+        request = Request(url + "?ref=" + quote(self.branch), headers=self.headers)
         try:
-            with urlopen(req, timeout=20) as response:
-                result = json.load(response)
-        except HTTPError as ex:
-            raise StudylogError(f"BAND API HTTP error {ex.code}.") from None
-        except (URLError, TimeoutError, OSError) as ex:
-            raise StudylogError(f"BAND API connection failed ({type(ex).__name__}).") from None
-        except (ValueError, TypeError):
-            raise StudylogError("BAND API returned an unreadable response.") from None
-        if result.get("result_code") != 1:
-            raise StudylogError(f"BAND API returned result_code={result.get('result_code')}.")
-        return result.get("result_data") or {}
+            with urlopen(request, timeout=20) as response:
+                data = json.load(response)
+        except HTTPError as err:
+            if err.code == 404:
+                self.sha = None
+                return {}
+            raise StudylogError(f"GitHub state read failed: HTTP {err.code}.") from None
+        except (URLError, TimeoutError, OSError):
+            raise StudylogError("GitHub state read connection failed.") from None
+        try:
+            self.sha = data["sha"]
+            state = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+            if not isinstance(state, dict) or any(
+                key not in weekly_posts(sunday) or status not in ("attempted", "posted")
+                for key, status in state.items()
+            ):
+                raise ValueError("Invalid state.")
+            return state
+        except (ValueError, TypeError, KeyError):
+            raise StudylogError("GitHub state is invalid.") from None
 
-    def ensure_permissions(self, required: str) -> None:
-        response = self.request("GET", "/v2/band/permissions", {"permissions": required})
-        allowed = response.get("permissions", response.get("permission", []))
-        if isinstance(allowed, dict):
-            allowed = list(allowed.keys())
-        required_set = set(required.split(","))
-        if not required_set.issubset(set(allowed or [])):
-            raise StudylogError("BAND account does not have the required posting/commenting permission.")
-
-    def paginated(self, path: str, params: dict) -> list[dict]:
-        items: list[dict] = []
-        next_params = dict(params)
-        visited: set[str] = set()
-        for _ in range(MAX_PAGES):
-            response = self.request("GET", path, next_params)
-            items.extend(response.get("items") or [])
-            cursor_data = (response.get("paging") or {}).get("next_params")
-            if not cursor_data:
-                return items
-            after = str(cursor_data.get("after") or "")
-            if not after or after in visited:
-                raise StudylogError("BAND pagination cursor is invalid or repeating.")
-            visited.add(after)
-            # Never trust a returned token or target band from pagination.
-            next_params = {**params, "after": after}
-            if cursor_data.get("limit"):
-                next_params["limit"] = cursor_data["limit"]
-        raise StudylogError("BAND pagination safety limit reached; no posts/comments were written.")
-
-    def posts(self) -> list[dict]:
-        return self.paginated("/v2/band/posts", {"locale": "ko_KR"})
-
-    def comments(self, post_key: str) -> list[dict]:
-        return self.paginated("/v2/band/post/comments", {"post_key": post_key, "sort": "+created_at"})
-
-    def create_post(self, content: str) -> None:
-        self.request("POST", "/v2.2/band/post/create", {"content": content, "do_push": "false"})
-
-    def create_comment(self, post_key: str, body: str) -> None:
-        self.request("POST", "/v2/band/post/comment/create", {"post_key": post_key, "body": body})
+    def save(self, sunday: dt.date, state: dict[str, str]) -> None:
+        url = f"{self.url_prefix}/{sunday.isoformat()}.json"
+        content = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+        payload = {
+            "message": f"Studylog posting status for {sunday.isoformat()}",
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+            "branch": self.branch,
+        }
+        if self.sha:
+            payload["sha"] = self.sha
+        req = Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers={**self.headers, "Content-Type": "application/json"}, method="PUT"
+        )
+        data = request_json(req, "GitHub state update")
+        try:
+            self.sha = data["content"]["sha"]
+        except (KeyError, TypeError):
+            raise StudylogError("GitHub did not confirm the state update.") from None
 
 
-def publish(api: BandAPI, sunday: dt.date) -> None:
-    api.ensure_permissions("posting")
-    posts = api.posts()
-    for day in weekly_dates(sunday):
-        if matching_post(posts, day) is not None:
-            print(f"Skip existing: {post_text(day)}")
+def publish(sunday: dt.date, writer: BandWriter, ledger: GitHubLedger) -> tuple[int, int]:
+    writer.require_posting_permission()
+    state = ledger.load(sunday)
+    posted = skipped = 0
+    for title in weekly_posts(sunday):
+        if title in state:
+            print(f"Skip {title} ({state[title]}).")
+            skipped += 1
             continue
-        # A failed POST is never automatically retried, to avoid duplicate writes.
-        api.create_post(post_text(day))
-        print(f"Created: {post_text(day)}")
+        # Mark BEFORE submitting. Failed/uncertain requests are never auto-retried.
+        state[title] = "attempted"
+        ledger.save(sunday, state)
+        writer.create_post(title)
+        state[title] = "posted"
+        ledger.save(sunday, state)
+        print(f"Created {title}.")
+        posted += 1
+    return posted, skipped
 
 
-def collect(api: BandAPI, day: dt.date) -> None:
-    api.ensure_permissions("commenting")
-    post = matching_post(api.posts(), day)
-    if not post:
-        raise StudylogError(f"Post not found for {post_text(day)}. No comment created.")
-    comments = api.comments(str(post["post_key"]))
-    if any(is_summary(comment_body(c)) for c in comments):
-        print("Existing summary found. No second summary posted.")
-        return
-    result = aggregate(comments, day)
-    # Do not print member names to GitHub Actions logs.
-    api.create_comment(str(post["post_key"]), result)
-    print(f"Summary posted to {post_text(day)}.")
-
-
-def validate_schedule(mode: str, moment: dt.datetime) -> bool:
-    local = moment.astimezone(KST)
-    if mode == "publish":
-        return local.weekday() == 6 and local.time() >= dt.time(9, 0)
-    if mode == "collect":
-        return local.weekday() < 6 and local.time() >= dt.time(7, 20)
-    return False
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Studylog weekly posts and leave summary")
-    parser.add_argument("--mode", choices=("auto", "preview", "publish", "collect"), default="auto")
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Weekly BAND post writer")
+    parser.add_argument("--mode", choices=("preview", "publish"), default="preview")
+    args = parser.parse_args(argv)
     now = dt.datetime.now(KST)
-    day = now.date()
+    sunday = sunday_for(now.date())
     if args.mode == "preview":
-        sunday = sunday_for(day)
-        print("Sunday:", sunday.isoformat())
-        print("Weekly posts:", " | ".join(post_text(x) for x in weekly_dates(sunday)))
-        sample = [
-            {"content": "반휴", "created_at": int(dt.datetime.combine(day, dt.time(7, 10), KST).timestamp() * 1000), "author": {"name": "김철수"}},
-            {"content": "월휴", "created_at": int(dt.datetime.combine(day, dt.time(7, 15), KST).timestamp() * 1000), "author": {"name": "홍길동"}},
-        ]
-        print("Sample summary:\n" + aggregate(sample, day))
+        print(f"Scheduled Sunday: {sunday} 09:00 KST")
+        print("\n".join(weekly_posts(sunday)))
+        print("Preview only. No BAND access.")
         return 0
 
-    mode = args.mode
-    if mode == "auto":
-        mode = "publish" if day.weekday() == 6 else "collect"
-    if not validate_schedule(mode, now):
-        print(f"Not scheduled for {mode} on {day.isoformat()} at {now:%H:%M} KST; skipped.")
+    if not scheduled_now(now):
+        print("Not Sunday at/after 09:00 KST. Skipping.")
         return 0
-    # Hard safety gate: an unapproved app cannot attempt real writes.
-    if os.getenv("BAND_LIVE_ENABLED", "").strip().lower() != "true":
-        print("BAND_LIVE_ENABLED is not true. Live BAND access disabled; skipped.")
+    if os.getenv("BAND_LIVE_ENABLED", "").lower() != "true":
+        print("BAND_LIVE_ENABLED not true. Posting disabled.")
         return 0
-    token = os.getenv("BAND_ACCESS_TOKEN", "")
-    band_key = os.getenv("BAND_KEY", "")
-    if not token or not band_key:
-        raise StudylogError("Missing BAND_ACCESS_TOKEN or BAND_KEY.")
-    api = BandAPI(token, band_key)
-    if mode == "publish":
-        publish(api, day)
-    else:
-        collect(api, day)
+    token = os.getenv("BAND_ACCESS_TOKEN")
+    band = os.getenv("BAND_KEY")
+    github_token = os.getenv("GITHUB_TOKEN")
+    repo = os.getenv("GITHUB_REPOSITORY")
+    if not all((token, band, github_token, repo)):
+        raise StudylogError("Missing BAND credentials or GitHub posting-state credentials.")
+    counts = publish(
+        sunday, BandWriter(token, band),
+        GitHubLedger(github_token, repo, os.getenv("GITHUB_REF_NAME") or "main")
+    )
+    print(f"Finished. Created: {counts[0]}, skipped: {counts[1]}.")
     return 0
 
 
@@ -258,5 +210,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except StudylogError as exc:
-        print(f"Studylog error: {exc}", file=sys.stderr)
+        print("Studylog error:", exc, file=sys.stderr)
         sys.exit(1)
